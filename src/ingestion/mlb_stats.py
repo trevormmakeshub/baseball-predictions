@@ -3,23 +3,63 @@
 
 import statsapi
 import pandas as pd
-from datetime import datetime
+import requests
+from datetime import datetime, timedelta
 from time import sleep
 
 from .config import config
 
+# Completed games only. The schedule request stops on this date.
+COMPLETED_STATUSES = {"Final", "Game Over", "Completed Early"}
+PULL_THROUGH = "2026-09-30"
+
+
+def _month_windows(start: str, end: str):
+    """Yield [start, end] pairs split on month boundaries."""
+    cursor = datetime.strptime(start, "%Y-%m-%d").date()
+    last = datetime.strptime(end, "%Y-%m-%d").date()
+    while cursor <= last:
+        if cursor.month == 12:
+            nxt = cursor.replace(year=cursor.year + 1, month=1, day=1)
+        else:
+            nxt = cursor.replace(month=cursor.month + 1, day=1)
+        chunk_end = min(last, nxt - timedelta(days=1))
+        yield cursor.isoformat(), chunk_end.isoformat()
+        cursor = chunk_end + timedelta(days=1)
+
+
+def _fetch_range(start: str, end: str, depth: int = 0) -> list:
+    """Fetch one schedule window. Split it if the MLB Stats API times out."""
+    try:
+        games = statsapi.schedule(start_date=start, end_date=end, sportId=1)
+        sleep(0.25)
+        return games
+    except requests.HTTPError as exc:
+        start_d = datetime.strptime(start, "%Y-%m-%d").date()
+        end_d = datetime.strptime(end, "%Y-%m-%d").date()
+        if depth >= 6 or start_d >= end_d:
+            raise
+        mid = start_d + (end_d - start_d) // 2
+        print(f"  split {start}..{end} after HTTP {exc.response.status_code}")
+        sleep(1.0)
+        left = _fetch_range(start, mid.isoformat(), depth + 1)
+        right = _fetch_range((mid + timedelta(days=1)).isoformat(), end, depth + 1)
+        return left + right
+
 
 def fetch_season_schedule(year: int) -> pd.DataFrame:
-    """Fetch every game for a given season.
+    """Fetch completed games for a season through 2026-09-30.
 
     Returns DataFrame with: game_id, date, away_team, home_team,
     away_score, home_score, status, venue, away_pitcher, home_pitcher.
     """
     start = f"{year}-02-20"  # Spring training start
-    end = f"{year}-11-05"    # Include postseason
+    end = min(f"{year}-11-05", PULL_THROUGH)
 
-    print(f"Fetching {year} schedule...")
-    games = statsapi.schedule(start_date=start, end_date=end)
+    print(f"Fetching {year} schedule through {end}...")
+    games = []
+    for chunk_start, chunk_end in _month_windows(start, end):
+        games.extend(_fetch_range(chunk_start, chunk_end))
 
     rows = []
     for g in games:
@@ -39,14 +79,24 @@ def fetch_season_schedule(year: int) -> pd.DataFrame:
         })
 
     df = pd.DataFrame(rows)
-    return df
+    if df.empty:
+        return df
+    df = df[df["date"] <= PULL_THROUGH]
+    df = df[df["status"].isin(COMPLETED_STATUSES)]
+    df = df[df["away_score"].notna() & df["home_score"].notna()]
+    df = df.drop_duplicates(subset=["game_id"])
+    return df.reset_index(drop=True)
 
 
 def fetch_all_schedules() -> pd.DataFrame:
-    """Fetch schedules for all configured years and save to CSV."""
+    """Fetch completed games for all configured years and save them."""
     all_dfs: list[pd.DataFrame] = []
-    for year in range(config.start_year, config.end_year + 1):
+    for year in range(config.start_year, min(config.end_year, 2026) + 1):
         df = fetch_season_schedule(year)
+        if df.empty:
+            print(f"  {year}: no completed games")
+            sleep(config.request_delay_sec)
+            continue
         # Filter to regular season + postseason only
         df = df[df["game_type"].isin(["R", "F", "D", "L", "W"])]
         outpath = config.raw_dir / "gamelogs" / f"schedule_{year}.csv"
@@ -55,8 +105,15 @@ def fetch_all_schedules() -> pd.DataFrame:
         all_dfs.append(df)
         sleep(config.request_delay_sec)
 
+    if not all_dfs:
+        return pd.DataFrame()
     combined = pd.concat(all_dfs, ignore_index=True)
     combined.to_csv(config.raw_dir / "gamelogs" / "schedule_all.csv", index=False)
+    tracked = config.processed_dir / "completed_games.parquet"
+    combined.to_parquet(tracked, index=False)
+    print(f"min date {combined['date'].min()}")
+    print(f"max date {combined['date'].max()}")
+    print(f"rows {len(combined)}")
     return combined
 
 
