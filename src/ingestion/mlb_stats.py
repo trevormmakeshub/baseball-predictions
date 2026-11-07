@@ -11,7 +11,7 @@ from .config import config
 
 # Completed games only. The schedule request stops on this date.
 COMPLETED_STATUSES = {"Final", "Game Over", "Completed Early"}
-PULL_THROUGH = "2026-09-30"
+PULL_THROUGH = "2026-11-07"
 
 
 def _month_windows(start: str, end: str):
@@ -48,13 +48,13 @@ def _fetch_range(start: str, end: str, depth: int = 0) -> list:
 
 
 def fetch_season_schedule(year: int) -> pd.DataFrame:
-    """Fetch completed games for a season through 2026-09-30.
+    """Fetch completed games for a season through 2026-11-07.
 
     Returns DataFrame with: game_id, date, away_team, home_team,
     away_score, home_score, status, venue, away_pitcher, home_pitcher.
     """
     start = f"{year}-02-20"  # Spring training start
-    end = min(f"{year}-11-05", PULL_THROUGH)
+    end = min(f"{year}-11-07", PULL_THROUGH)
 
     print(f"Fetching {year} schedule through {end}...")
     games = []
